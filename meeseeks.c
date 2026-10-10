@@ -23,11 +23,14 @@
  *   Paso 4: memoria compartida + semaforo para contadores de Meeseeks.
  *   Paso 5: texto libre con dificultad, espera simulada y caso facil (>85).
  *   Paso 6: creacion recursiva de Meeseeks, solicitud por pipe, reparto de trabajo y limite de Meeseeks.
+ *   Paso 7: resultado hacia el padre por pipe, orden de terminar a los hermanos, y despedida en cadena hasta el Meeseeks original.
  * ============================================================================
  */
  
 #include <errno.h>
 #include <math.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,9 +81,35 @@ typedef struct {
     char   text[MAX_REQ];/* solicitud del usuario */
 } job_t;
  
-typedef void (*meeseeks_body_t)(const job_t *job);
+/* ---------------------------------------------------------------------------
+ * msg_t: mensaje corto que viaja por los pipes entre padre e hijo.
+ *   hacia abajo (padre -> hijo):  MSG_TERMINATE (hay que desaparecer)
+ *   hacia arriba (hijo -> padre): MSG_SOLVED (alguien resolvio la solicitud;
+ *                                 trae los datos del Meeseeks que la resolvio)
+ *                                 MSG_FAILED (ni yo ni mis ayudantes pudimos)
+ * ------------------------------------------------------------------------- */
+typedef enum { MSG_TERMINATE = 1, MSG_SOLVED = 2, MSG_FAILED = 3 } msg_type_t;
  
-static pid_t spawn_meeseeks(meeseeks_body_t body, const job_t *job);
+typedef struct {
+    int type;       /* msg_type_t */
+    int pid;        /* datos del Meeseeks que resolvio (solo en MSG_SOLVED) */
+    int ppid;
+    int level;      /* N */
+    int instance;   /* i */
+} msg_t;
+ 
+/* helper_t: lo que un creador guarda de cada Meeseeks que crea */
+typedef struct {
+    pid_t pid;
+    int   to_child;     /* extremo de escritura: ordenes hacia el hijo */
+    int   from_child;   /* extremo de lectura: resultados del hijo */
+} helper_t;
+ 
+/* Un Meeseeks recibe su mensaje de trabajo por down_fd (de lectura) y manda
+ * sus resultados al padre por up_fd (de escritura). */
+typedef void (*meeseeks_body_t)(const job_t *job, int down_fd, int up_fd);
+ 
+static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h);
  
 #define DEFAULT_MAX_MEESEEKS 100   /* limite de Meeseeks por solicitud (-m) */
 #define DEFAULT_COORD_FACTOR 1.5   /* costo de coordinacion al repartir (-f) */
@@ -113,6 +142,7 @@ typedef struct {
     int   total_created;                 /* Meeseeks creados (reservados) en la solicitud */
     int   active;                        /* Meeseeks vivos en este momento */
     int   max_level;                     /* nivel N mas profundo alcanzado */
+    int   terminated;                    /* Meeseeks mandados a desaparecer antes de terminar */
     double sim_wait;                     /* espera simulada (s) a descontar del tiempo real */
     int   level_count[MAX_LEVELS + 1];   /* Meeseeks creados por nivel */
 } shared_t;
@@ -153,6 +183,7 @@ static void shared_reset(void)
     shared->total_created = 0;
     shared->active = 0;
     shared->max_level = 0;
+    shared->terminated = 0;
     shared->sim_wait = 0;
     memset(shared->level_count, 0, sizeof(shared->level_count));
     shared_unlock();
@@ -201,6 +232,14 @@ static void shared_unregister(void)
     shared_unlock();
 }
  
+/* Un Meeseeks se despide por orden de su padre (no por haber terminado). */
+static void shared_note_terminated(void)
+{
+    shared_lock();
+    shared->terminated++;
+    shared_unlock();
+}
+ 
 /* Registra el tiempo de espera simulado (conserva el mayor camino). */
 static void shared_note_wait(double seconds)
 {
@@ -212,9 +251,11 @@ static void shared_note_wait(double seconds)
  
 /* Copia de forma segura los contadores actuales. */
 static void shared_snapshot(int *total, int *active, int *max_level,
-                            double *sim_wait, char *levels, size_t levels_size)
+                            int *terminated, double *sim_wait,
+                            char *levels, size_t levels_size)
 {
     shared_lock();
+    *terminated = shared->terminated;
     *total     = shared->total_created;
     *active    = shared->active;
     *max_level = shared->max_level;
@@ -325,8 +366,10 @@ static int split_args(char *line, char **argv, int max)
  * su codigo de retorno. Solo importa si termino con exito (0) o no.
  * Termina con exit 0 si la tarea se completo y exit 1 si no.
  * ------------------------------------------------------------------------- */
-static void meeseeks_run_program(const job_t *job)
+static void meeseeks_run_program(const job_t *job, int down_fd, int up_fd)
 {
+    close(down_fd);   /* este tipo de Meeseeks no usa los pipes de ayudantes */
+    close(up_fd);
     char  buf[MAX_REQ];
     char *argv[MAX_ARGS];
     char  msg[MAX_REQ + 64];
@@ -351,6 +394,7 @@ static void meeseeks_run_program(const job_t *job)
     }
     if (worker == 0) {
         /* Trabajador: se convierte en el programa externo */
+        signal(SIGPIPE, SIG_DFL);   /* el programa externo la espera normal */
         execvp(argv[0], argv);
         perror("execvp");
         _exit(127);
@@ -438,6 +482,7 @@ static int run_bc(const char *expr, char *out, size_t out_size)
         close(to_bc[0]);   close(to_bc[1]);
         close(from_bc[0]); close(from_bc[1]);
         setenv("BC_LINE_LENGTH", "0", 1);
+        signal(SIGPIPE, SIG_DFL);
         execlp("bc", "bc", (char *)NULL);
         perror("execlp bc");
         _exit(127);
@@ -486,8 +531,10 @@ static int run_bc(const char *expr, char *out, size_t out_size)
  * Es una tarea sencilla: un solo Meeseeks (N=1, i=1) pide el calculo a bc y
  * reporta el resultado o el error. exit 0 = completada, exit 1 = no.
  * ------------------------------------------------------------------------- */
-static void meeseeks_calc(const job_t *job)
+static void meeseeks_calc(const job_t *job, int down_fd, int up_fd)
 {
+    close(down_fd);   /* este tipo de Meeseeks no usa los pipes de ayudantes */
+    close(up_fd);
     char msg[MAX_CALC_OUT + 128];
     char out[MAX_CALC_OUT];
  
@@ -611,124 +658,6 @@ static double random_difficulty(void)
 }
  
 /* ---------------------------------------------------------------------------
- * meeseeks_text: cuerpo de un Meeseeks que atiende texto libre (nivel 1 o un
- * ayudante de cualquier nivel). Resuelve su parte o pide ayuda a otros
- * Meeseeks y espera a que terminen.
- * Por ahora espera a TODOS sus ayudantes; el aviso inmediato al primero que
- * resuelva y la despedida en cadena se agregan en un paso posterior.
- * Termina con exit 0 si la tarea se resolvio y exit 1 si no.
- * ------------------------------------------------------------------------- */
-static void meeseeks_text(const job_t *job)
-{
-    char msg[MAX_REQ + 256];
-    int  level = job->level;
- 
-    meeseeks_start(level, job->instance);
-    /* Cada proceso necesita su propia semilla: si no, todos darian lo mismo */
-    srand48(time(NULL) ^ ((long)getpid() << 16));
- 
-    snprintf(msg, sizeof(msg), "Solicitud recibida por pipe: \"%s\"", job->text);
-    meeseeks_say(msg);
- 
-    /* --- dificultad de mi parte --- */
-    double work = job->work;
-    int impossible = job->impossible;
-    double d;
-    const char *origin;
-    if (work < 0) {                       /* solo el primer Meeseeks: al azar */
-        d = random_difficulty();
-        work = 100.0 - d;
-        impossible = (d <= 0.0);
-        origin = "calculada al azar";
-    } else {
-        d = 100.0 - work;
-        origin = (level == 1) ? "definida por el usuario" : "parte que me dio mi padre";
-    }
-    snprintf(msg, sizeof(msg), "Dificultad: %.2f (%s)%s", d, origin,
-             impossible ? " IMPOSIBLE" : "");
-    meeseeks_say(msg);
- 
-    /* --- tiempo de simulacion --- */
-    double w = job->wait;
-    if (w < 0)
-        w = 0.5 + drand48() * 4.5;        /* uniforme entre 0.5 y 5 s */
-    double chain = job->chain_wait + w;   /* espera acumulada desde el primer Meeseeks */
-    snprintf(msg, sizeof(msg), "Voy a trabajar en esto durante %.2f s...", w);
-    meeseeks_say(msg);
-    shared_note_wait(chain);              /* el Box descontara el camino mas largo */
-    usleep((useconds_t)(w * 1e6));
- 
-    /* --- caso facil: lo resuelvo yo solo --- */
-    if (!impossible && d > EASY_THRESHOLD) {
-        meeseeks_say("Era facil, resolvi mi parte. Gracias por dejarme servirle. Adios!");
-        meeseeks_exit(0);
-    }
- 
-    /* --- caso dificil: pido ayuda --- */
-    int k = (d <= HARD_THRESHOLD) ? 5 : 2;
-    if (!shared_reserve(k, level + 1)) {
-        snprintf(msg, sizeof(msg),
-                 "Necesito %d ayudantes pero se alcanzo el limite de Meeseeks. "
-                 "Para no colapsar el sistema, no creo mas.", k);
-        meeseeks_say(msg);
-        meeseeks_say("No pude completar mi parte. Adios!");
-        meeseeks_exit(1);
-    }
-    snprintf(msg, sizeof(msg),
-             "Esto es dificil (%.2f). Creo %d Meeseeks nuevos en el nivel %d.",
-             d, k, level + 1);
-    meeseeks_say(msg);
- 
-    /* Reparto desigual del trabajo: pesos al azar entre 0.7 y 1.3 */
-    double weights[MAX_HELPERS], sum = 0;
-    for (int i = 0; i < k; i++) {
-        weights[i] = 0.7 + 0.6 * drand48();
-        sum += weights[i];
-    }
- 
-    pid_t kids[MAX_HELPERS];
-    int   created = 0;
-    for (int i = 0; i < k; i++) {
-        job_t child;
-        memset(&child, 0, sizeof(child));
-        child.level      = level + 1;
-        child.instance   = i + 1;
-        child.work       = impossible ? work : work * coord_factor * weights[i] / sum;
-        child.wait       = job->wait;
-        child.chain_wait = chain;
-        child.impossible = impossible;
-        snprintf(child.text, sizeof(child.text), "%s", job->text);
- 
-        pid_t pid = spawn_meeseeks(meeseeks_text, &child);
-        if (pid < 0) {
-            shared_release(level + 1);    /* no nacio: devuelve la reserva */
-            continue;
-        }
-        kids[created++] = pid;
-    }
- 
-    /* Espero a mis ayudantes; basta con que uno haya resuelto */
-    int solved = 0;
-    for (int i = 0; i < created; i++) {
-        int status = 0;
-        while (waitpid(kids[i], &status, 0) < 0 && errno == EINTR)
-            ;
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-            solved++;
-    }
-    snprintf(msg, sizeof(msg), "Mis %d ayudantes terminaron: %d resolvieron su parte.",
-             created, solved);
-    meeseeks_say(msg);
- 
-    if (solved > 0) {
-        meeseeks_say("Solicitud completada gracias a mis ayudantes. Gracias por dejarme servirle. Adios!");
-        meeseeks_exit(0);
-    }
-    meeseeks_say("Mis ayudantes no lograron resolverlo. No pude completar la solicitud. Adios!");
-    meeseeks_exit(1);
-}
- 
-/* ---------------------------------------------------------------------------
  * write_all / read_all: escriben o leen exactamente n bytes de un pipe.
  * ------------------------------------------------------------------------- */
 static int write_all(int fd, const void *buf, size_t n)
@@ -738,7 +667,7 @@ static int write_all(int fd, const void *buf, size_t n)
         ssize_t w = write(fd, p, n);
         if (w < 0) {
             if (errno == EINTR) continue;
-            return -1;
+            return -1;      /* por ejemplo EPIPE: el otro lado ya no existe */
         }
         p += w;
         n -= (size_t)w;
@@ -763,45 +692,329 @@ static int read_all(int fd, void *buf, size_t n)
     return 0;
 }
  
-/* ---------------------------------------------------------------------------
- * spawn_meeseeks: crea un Meeseeks con fork. Antes de nacer se abre un pipe
- * privado entre quien lo crea y el nuevo Meeseeks; por ese pipe viaja el
- * mensaje (job_t) con la solicitud. El hijo ejecuta 'body' y nunca regresa.
- *
- * Los dos lados cierran el extremo del pipe que no usan, y el padre cierra
- * su extremo de escritura antes de crear el siguiente hijo, asi ningun
- * Meeseeks hereda los pipes de sus hermanos.
- * Devuelve el pid del hijo, o -1 si fallo.
- * ------------------------------------------------------------------------- */
-static pid_t spawn_meeseeks(meeseeks_body_t body, const job_t *job)
+/* Envia un mensaje corto; 'who' son los datos del que resolvio (o NULL). */
+static void send_msg(int fd, int type, const msg_t *who)
 {
-    int fds[2];
+    msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = type;
+    if (who != NULL) {
+        m.pid      = who->pid;
+        m.ppid     = who->ppid;
+        m.level    = who->level;
+        m.instance = who->instance;
+    }
+    write_all(fd, &m, sizeof(m));   /* si el receptor ya no existe, no importa */
+}
  
-    if (pipe(fds) < 0) {
+/* ---------------------------------------------------------------------------
+ * told_to_terminate: el Meeseeks "trabaja" durante 'seconds' pero sigue
+ * atento al pipe de su padre. Devuelve 1 si le ordenaron terminar (o si el
+ * padre desaparecio), 0 si el tiempo se cumplio.
+ * ------------------------------------------------------------------------- */
+static int told_to_terminate(int down_fd, double seconds)
+{
+    double deadline = now_seconds() + seconds;
+ 
+    for (;;) {
+        double remaining = deadline - now_seconds();
+        if (remaining <= 0)
+            return 0;
+ 
+        struct pollfd p = { down_fd, POLLIN, 0 };
+        int r = poll(&p, 1, (int)(remaining * 1000.0) + 1);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return 0;
+        }
+        if (r == 0)
+            continue;               /* se cumplio el tiempo; el ciclo lo confirma */
+ 
+        msg_t m;
+        ssize_t n = read(down_fd, &m, sizeof(m));
+        if (n != (ssize_t)sizeof(m) || m.type == MSG_TERMINATE)
+            return 1;
+    }
+}
+ 
+/* El Meeseeks original informa al usuario quien resolvio la solicitud. */
+static void report_solver(const msg_t *who)
+{
+    char msg[200];
+    snprintf(msg, sizeof(msg),
+             "RESULTADO: la solicitud fue resuelta por el Meeseeks (pid %d, ppid %d, N=%d, i=%d).",
+             who->pid, who->ppid, who->level, who->instance);
+    meeseeks_say(msg);
+}
+ 
+/* ---------------------------------------------------------------------------
+ * meeseeks_text: cuerpo de un Meeseeks que atiende texto libre (nivel 1 o un
+ * ayudante de cualquier nivel). Resuelve su parte o pide ayuda a otros
+ * Meeseeks.
+ *
+ * Comunicacion por pipes:
+ *   - Resolver:   el que resuelve avisa a su padre (MSG_SOLVED con sus datos).
+ *                 El padre manda MSG_TERMINATE a los demas hijos, espera a que
+ *                 todos desaparezcan, se despide y avisa a SU padre, y asi
+ *                 hacia atras hasta el Meeseeks original, que informa al
+ *                 usuario quien resolvio.
+ *   - Terminar:   quien recibe MSG_TERMINATE se lo pasa a sus propios
+ *                 ayudantes (la orden baja en cascada), espera a que se
+ *                 vayan, se despide y desaparece.
+ *   - Fallar:     si ni el ni sus ayudantes pueden, avisa MSG_FAILED.
+ *
+ * Termina con exit 0 si se resolvio, 1 si no, y 3 si lo mandaron a terminar.
+ * ------------------------------------------------------------------------- */
+static void meeseeks_text(const job_t *job, int down_fd, int up_fd)
+{
+    char msg[MAX_REQ + 256];
+    int  level = job->level;
+ 
+    meeseeks_start(level, job->instance);
+    /* Cada proceso necesita su propia semilla: si no, todos darian lo mismo */
+    srand48(time(NULL) ^ ((long)getpid() << 16));
+ 
+    msg_t me;
+    memset(&me, 0, sizeof(me));
+    me.type     = MSG_SOLVED;
+    me.pid      = getpid();
+    me.ppid     = getppid();
+    me.level    = level;
+    me.instance = job->instance;
+ 
+    snprintf(msg, sizeof(msg), "Solicitud recibida por pipe: \"%s\"", job->text);
+    meeseeks_say(msg);
+ 
+    /* --- dificultad de mi parte --- */
+    double work = job->work;
+    int impossible = job->impossible;
+    double d;
+    const char *origin;
+    if (work < 0) {                       /* solo el primer Meeseeks: al azar */
+        d = random_difficulty();
+        work = 100.0 - d;
+        impossible = (d <= 0.0);
+        origin = "calculada al azar";
+    } else {
+        d = 100.0 - work;
+        origin = (level == 1) ? "definida por el usuario" : "parte que me dio mi padre";
+    }
+    snprintf(msg, sizeof(msg), "Dificultad: %.2f (%s)%s", d, origin,
+             impossible ? " IMPOSIBLE" : "");
+    meeseeks_say(msg);
+ 
+    /* --- tiempo de simulacion (atento a una orden de terminar) --- */
+    double w = job->wait;
+    if (w < 0)
+        w = 0.5 + drand48() * 4.5;        /* uniforme entre 0.5 y 5 s */
+    double chain = job->chain_wait + w;   /* espera acumulada desde el primer Meeseeks */
+    snprintf(msg, sizeof(msg), "Voy a trabajar en esto durante %.2f s...", w);
+    meeseeks_say(msg);
+ 
+    if (told_to_terminate(down_fd, w)) {
+        meeseeks_say("Mi padre me pidio terminar. Me despido. Adios!");
+        shared_note_terminated();
+        meeseeks_exit(3);
+    }
+    /* Solo cuenta la espera de quien la completo: asi el Box descuenta el
+     * camino de espera del Meeseeks que realmente resolvio. */
+    shared_note_wait(chain);
+ 
+    /* --- caso facil: lo resuelvo yo solo --- */
+    if (!impossible && d > EASY_THRESHOLD) {
+        meeseeks_say("Era facil, resolvi mi parte. Gracias por dejarme servirle. Adios!");
+        if (level == 1)
+            report_solver(&me);
+        else
+            send_msg(up_fd, MSG_SOLVED, &me);
+        meeseeks_exit(0);
+    }
+ 
+    /* --- caso dificil: pido ayuda --- */
+    int k = (d <= HARD_THRESHOLD) ? 5 : 2;
+    if (!shared_reserve(k, level + 1)) {
+        snprintf(msg, sizeof(msg),
+                 "Necesito %d ayudantes pero se alcanzo el limite de Meeseeks. "
+                 "Para no colapsar el sistema, no creo mas.", k);
+        meeseeks_say(msg);
+        meeseeks_say("No pude completar mi parte. Adios!");
+        if (level > 1)
+            send_msg(up_fd, MSG_FAILED, NULL);
+        meeseeks_exit(1);
+    }
+    snprintf(msg, sizeof(msg),
+             "Esto es dificil (%.2f). Creo %d Meeseeks nuevos en el nivel %d.",
+             d, k, level + 1);
+    meeseeks_say(msg);
+ 
+    /* Reparto desigual del trabajo: pesos al azar entre 0.7 y 1.3 */
+    double weights[MAX_HELPERS], sum = 0;
+    for (int i = 0; i < k; i++) {
+        weights[i] = 0.7 + 0.6 * drand48();
+        sum += weights[i];
+    }
+ 
+    helper_t kids[MAX_HELPERS];
+    int      created = 0;
+    for (int i = 0; i < k; i++) {
+        job_t child;
+        memset(&child, 0, sizeof(child));
+        child.level      = level + 1;
+        child.instance   = i + 1;
+        child.work       = impossible ? work : work * coord_factor * weights[i] / sum;
+        child.wait       = job->wait;
+        child.chain_wait = chain;
+        child.impossible = impossible;
+        snprintf(child.text, sizeof(child.text), "%s", job->text);
+ 
+        if (spawn_meeseeks(meeseeks_text, &child, &kids[created]) < 0) {
+            shared_release(level + 1);    /* no nacio: devuelve la reserva */
+            continue;
+        }
+        created++;
+    }
+ 
+    /* --- espero noticias: de mis ayudantes (resultados) o de mi padre (orden) --- */
+    struct pollfd pfds[1 + MAX_HELPERS];
+    int    done[MAX_HELPERS] = { 0 };     /* ya reporto su resultado */
+    int    pending = created;
+    int    solved = 0, terminated = 0;
+    msg_t  winner;
+    memset(&winner, 0, sizeof(winner));
+ 
+    while (pending > 0 && !solved && !terminated) {
+        pfds[0].fd = down_fd;
+        pfds[0].events = POLLIN;
+        for (int i = 0; i < created; i++) {
+            pfds[1 + i].fd = done[i] ? -1 : kids[i].from_child;   /* -1: poll lo ignora */
+            pfds[1 + i].events = POLLIN;
+        }
+        if (poll(pfds, (nfds_t)(1 + created), -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+ 
+        if (pfds[0].revents) {            /* orden de mi padre */
+            msg_t m;
+            ssize_t n = read(down_fd, &m, sizeof(m));
+            if (n != (ssize_t)sizeof(m) || m.type == MSG_TERMINATE) {
+                terminated = 1;
+                break;
+            }
+        }
+        for (int i = 0; i < created; i++) {   /* resultados de mis ayudantes */
+            if (done[i] || !pfds[1 + i].revents)
+                continue;
+            msg_t m;
+            ssize_t n = read(kids[i].from_child, &m, sizeof(m));
+            done[i] = 1;
+            pending--;
+            if (n == (ssize_t)sizeof(m) && m.type == MSG_SOLVED && !solved) {
+                solved = 1;
+                winner = m;
+            }
+        }
+    }
+ 
+    /* Si ya se resolvio (o me mandaron terminar), los ayudantes que aun
+     * trabajan reciben la orden de desaparecer. */
+    if (solved || terminated) {
+        int told = 0;
+        for (int i = 0; i < created; i++)
+            if (!done[i]) {
+                send_msg(kids[i].to_child, MSG_TERMINATE, NULL);
+                told++;
+            }
+        if (told > 0) {
+            snprintf(msg, sizeof(msg), "Mando a desaparecer a %d ayudante(s) que aun trabajan.", told);
+            meeseeks_say(msg);
+        }
+    }
+ 
+    /* Espero a que todos mis ayudantes desaparezcan (se despiden primero) */
+    for (int i = 0; i < created; i++) {
+        int status = 0;
+        while (waitpid(kids[i].pid, &status, 0) < 0 && errno == EINTR)
+            ;
+        close(kids[i].to_child);
+        close(kids[i].from_child);
+    }
+ 
+    if (terminated) {
+        meeseeks_say("Mi padre me pidio terminar y mis ayudantes ya se fueron. Me despido. Adios!");
+        shared_note_terminated();
+        meeseeks_exit(3);
+    }
+    if (solved) {
+        meeseeks_say("Uno de mis ayudantes resolvio la solicitud. Gracias por dejarme servirle. Adios!");
+        if (level == 1)
+            report_solver(&winner);       /* el original informa al usuario */
+        else
+            send_msg(up_fd, MSG_SOLVED, &winner);   /* se lo paso a mi padre */
+        meeseeks_exit(0);
+    }
+ 
+    meeseeks_say("Mis ayudantes no lograron resolverlo. No pude completar la solicitud. Adios!");
+    if (level > 1)
+        send_msg(up_fd, MSG_FAILED, NULL);
+    meeseeks_exit(1);
+}
+ 
+/* ---------------------------------------------------------------------------
+ * spawn_meeseeks: crea un Meeseeks con fork y le abre dos pipes privados:
+ *   - hacia el hijo: por ahi viaja primero su mensaje de trabajo (job_t) y
+ *     despues las ordenes (MSG_TERMINATE)
+ *   - desde el hijo: por ahi vuelve su resultado
+ * El hijo cierra todos los demas descriptores heredados (los pipes de sus
+ * hermanos y del padre), asi cada pipe tiene solo los extremos que corresponden
+ * y se puede detectar cuando alguien desaparece. El hijo ejecuta 'body' y
+ * nunca regresa. Devuelve 0 si todo salio bien, -1 si fallo.
+ * ------------------------------------------------------------------------- */
+static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h)
+{
+    int down[2], up[2];
+ 
+    if (pipe(down) < 0) {
         perror("pipe");
+        return -1;
+    }
+    if (pipe(up) < 0) {
+        perror("pipe");
+        close(down[0]);
+        close(down[1]);
         return -1;
     }
     fflush(stdout);
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        close(fds[0]);
-        close(fds[1]);
+        close(down[0]); close(down[1]);
+        close(up[0]);   close(up[1]);
         return -1;
     }
     if (pid == 0) {
+        /* Hijo: se queda solo con su extremo de lectura de ordenes y su
+         * extremo de escritura de resultados */
+        int my_down = down[0], my_up = up[1];
+        for (int fd = 3; fd < 64; fd++)
+            if (fd != my_down && fd != my_up)
+                close(fd);
+ 
         job_t mine;
-        close(fds[1]);
-        if (read_all(fds[0], &mine, sizeof(mine)) < 0)
+        if (read_all(my_down, &mine, sizeof(mine)) < 0)
             _exit(1);
-        close(fds[0]);
-        body(&mine);            /* no regresa */
+        body(&mine, my_down, my_up);    /* no regresa */
         _exit(1);
     }
-    close(fds[0]);
-    write_all(fds[1], job, sizeof(*job));
-    close(fds[1]);
-    return pid;
+ 
+    /* Padre: se queda con los extremos opuestos */
+    close(down[0]);
+    close(up[1]);
+    h->pid        = pid;
+    h->to_child   = down[1];
+    h->from_child = up[0];
+    write_all(h->to_child, job, sizeof(*job));
+    return 0;
 }
  
 /* ---------------------------------------------------------------------------
@@ -844,21 +1057,25 @@ static int handle_request(req_type_t type, const char *payload,
  
     shared_reset();
     shared_reserve(1, 1);               /* el primer Meeseeks */
-    pid_t pid = spawn_meeseeks(body, &job);
-    if (pid < 0) {
+ 
+    helper_t first;
+    if (spawn_meeseeks(body, &job, &first) < 0) {
         shared_release(1);
         return 0;
     }
  
     int status = 0;
-    waitpid(pid, &status, 0);
+    waitpid(first.pid, &status, 0);
+    close(first.to_child);
+    close(first.from_child);
  
-    int  total, active, max_level;
+    int  total, active, max_level, terminated;
     char levels[256];
-    shared_snapshot(&total, &active, &max_level, sim_wait, levels, sizeof(levels));
+    shared_snapshot(&total, &active, &max_level, &terminated, sim_wait,
+                    levels, sizeof(levels));
     *meeseeks_created = total;
-    printf("[Box %d] Meeseeks creados: %d (%s) | activos: %d | nivel maximo: %d | espera simulada: %.3f s\n",
-           getpid(), total, levels, active, max_level, *sim_wait);
+    printf("[Box %d] Meeseeks creados: %d (%s) | terminados por orden: %d | activos: %d | nivel maximo: %d | espera simulada: %.3f s\n",
+           getpid(), total, levels, terminated, active, max_level, *sim_wait);
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
  
@@ -918,6 +1135,7 @@ int main(int argc, char **argv)
     }
  
     shared_init(max_meeseeks);
+    signal(SIGPIPE, SIG_IGN);   /* escribir a un Meeseeks que ya se fue no debe matarnos */
  
     printf("Box de Mr. Meeseeks (pid %d)\n", getpid());
     printf("Limite de Meeseeks por solicitud: %d | factor de coordinacion: %.2f\n",
