@@ -1,0 +1,21 @@
+id,tipo,solicitud,dificultad,duracion_real_s,espera_simulada_s,estado,meeseeks,nivel_max,terminados,exceso_s,factor,limite_meeseeks,tiempo_max_s
+1,texto,solicitud realista 1,97.10,0.001574,0.828849,TERMINADA,1,1,0,0.000000,1.50,1000,600
+2,texto,solicitud realista 2,0.00,0.022262,15.288998,NO_TERMINADA,996,10,0,0.000000,1.50,1000,600
+3,texto,solicitud realista 3,50.04,0.019653,11.050153,TERMINADA,19,6,13,0.000000,1.50,1000,600
+4,texto,solicitud realista 4,78.28,0.009925,6.753420,TERMINADA,5,3,2,0.000000,1.50,1000,600
+5,texto,solicitud realista 5,60.95,0.015670,11.692253,TERMINADA,15,5,11,0.000000,1.50,1000,600
+6,texto,solicitud realista 6,0.73,0.016085,8.373369,TERMINADA,28,5,23,0.000000,1.50,1000,600
+7,texto,solicitud realista 7,79.24,0.007013,9.143156,TERMINADA,7,3,4,0.000000,1.50,1000,600
+8,texto,solicitud realista 8,15.16,0.011117,6.840588,TERMINADA,18,4,15,0.000000,1.50,1000,600
+9,texto,solicitud realista 9,18.37,0.010473,5.193358,TERMINADA,18,4,15,0.000000,1.50,1000,600
+10,texto,solicitud realista 10,0.00,0.022951,14.959347,NO_TERMINADA,996,9,0,0.000000,1.50,1000,600
+11,texto,solicitud realista 11,38.10,0.010710,4.692304,TERMINADA,10,3,8,0.000000,1.50,1000,600
+12,texto,solicitud realista 12,54.25,0.009927,4.250416,TERMINADA,9,4,5,0.000000,1.50,1000,600
+13,texto,solicitud realista 13,30.77,0.011700,5.726723,TERMINADA,22,4,18,0.000000,1.50,1000,600
+14,texto,solicitud realista 14,63.99,0.013847,7.880133,TERMINADA,11,4,7,0.000000,1.50,1000,600
+15,texto,solicitud realista 15,31.81,0.009610,6.242295,TERMINADA,18,4,15,0.000000,1.50,1000,600
+16,texto,solicitud realista 16,77.86,0.009309,5.235989,TERMINADA,5,3,2,0.000000,1.50,1000,600
+17,texto,solicitud realista 17,45.82,0.020932,12.431007,TERMINADA,27,6,22,0.000000,1.50,1000,600
+18,texto,solicitud realista 18,64.75,0.011609,7.365595,TERMINADA,15,4,11,0.000000,1.50,1000,600
+19,texto,solicitud realista 19,38.93,0.010279,5.107787,TERMINADA,10,3,7,0.000000,1.50,1000,600
+20,texto,solicitud realista 20,7.65,0.015892,9.885490,TERMINADA,24,4,20,0.000000,1.50,1000,600

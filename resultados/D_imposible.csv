@@ -1,0 +1,4 @@
+id,tipo,solicitud,dificultad,duracion_real_s,espera_simulada_s,estado,meeseeks,nivel_max,terminados,exceso_s,factor,limite_meeseeks,tiempo_max_s
+1,texto,dif=0: imposible,0.00,0.021045,13.401028,NO_TERMINADA,96,6,0,8.422049,1.50,100,5
+1,texto,dif=0: imposible,0.00,0.021215,13.377881,NO_TERMINADA,96,6,0,8.399066,1.50,100,5
+1,texto,dif=0: imposible,0.00,0.017966,10.527224,NO_TERMINADA,96,6,0,5.545159,1.50,100,5

@@ -1,0 +1,13 @@
+id,tipo,solicitud,dificultad,duracion_real_s,espera_simulada_s,estado,meeseeks,nivel_max,terminados,exceso_s,factor,limite_meeseeks,tiempo_max_s
+1,texto,dif=20: experimento B,20.00,0.012812,8.365676,TERMINADA,20,4,17,0.000000,1.50,1000,600
+2,texto,dif=20: experimento B,20.00,0.007210,3.825981,TERMINADA,10,3,7,0.000000,1.50,1000,600
+3,texto,dif=20: experimento B,20.00,0.009716,4.527856,TERMINADA,18,4,15,0.000000,1.50,1000,600
+4,texto,dif=40: experimento B,40.00,0.005823,3.861614,TERMINADA,6,2,4,0.000000,1.50,1000,600
+5,texto,dif=40: experimento B,40.00,0.006260,3.602096,TERMINADA,6,2,4,0.000000,1.50,1000,600
+6,texto,dif=40: experimento B,40.00,0.007099,4.754301,TERMINADA,10,3,8,0.000000,1.50,1000,600
+7,texto,dif=60: experimento B,60.00,0.013391,8.005041,TERMINADA,11,4,7,0.000000,1.50,1000,600
+8,texto,dif=60: experimento B,60.00,0.012276,8.077915,TERMINADA,11,5,7,0.000000,1.50,1000,600
+9,texto,dif=60: experimento B,60.00,0.017170,11.467588,TERMINADA,19,5,15,0.000000,1.50,1000,600
+10,texto,dif=80: experimento B,80.00,0.013566,8.824486,TERMINADA,5,3,2,0.000000,1.50,1000,600
+11,texto,dif=80: experimento B,80.00,0.004865,2.470985,TERMINADA,3,2,1,0.000000,1.50,1000,600
+12,texto,dif=80: experimento B,80.00,0.006915,4.572135,TERMINADA,3,2,1,0.000000,1.50,1000,600
