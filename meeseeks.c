@@ -16,10 +16,11 @@
  *     - Ejecucion de un programa externo       (prefijo "run:")
  *   Escribir "salir" para despedirse y ver el informe final.
  *
- * Estado del desarrollo:
+* Estado del desarrollo:
  *   Paso 1: esqueleto del Box, lectura de solicitudes y estadisticas.
  *   Paso 2: solicitudes "run:" (fork + exec + waitpid, con argumentos).
  *   Paso 3: solicitudes "calc:" (programa bc mediante pipes).
+ *   Paso 4: memoria compartida + semaforo para contadores de Meeseeks.
  * ============================================================================
  */
  
@@ -30,6 +31,8 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <semaphore.h>
  
 #define MAX_ARGS    32    /* maximo de argumentos de un programa externo */
  
@@ -54,6 +57,106 @@ typedef struct {
  
 static task_t tasks[MAX_TASKS];
 static int    task_count = 0;
+ 
+/* ===========================================================================
+ * MEMORIA COMPARTIDA Y SEMAFORO
+ *
+ * El Box crea (antes de cualquier fork) una region de memoria compartida
+ * anonima con mmap(MAP_SHARED). Todos los procesos Meeseeks la heredan y ven
+ * la misma memoria. Contiene los contadores globales de niveles e instancias.
+ *
+ * El acceso esta protegido con un semaforo POSIX (sem_t, pshared = 1) que
+ * administra el sistema operativo. Cada lectura o escritura de los contadores
+ * ocurre entre sem_wait() y sem_post() (exclusion mutua).
+ * ========================================================================= */
+ 
+#define MAX_LEVELS 64
+ 
+typedef struct {
+    sem_t lock;                          /* semaforo binario (mutex entre procesos) */
+    int   total_created;                 /* Meeseeks creados en la solicitud actual */
+    int   active;                        /* Meeseeks vivos en este momento */
+    int   max_level;                     /* nivel N mas profundo alcanzado */
+    int   level_count[MAX_LEVELS + 1];   /* instancias creadas por nivel */
+} shared_t;
+ 
+static shared_t *shared = NULL;
+ 
+static void shared_lock(void)
+{
+    while (sem_wait(&shared->lock) < 0)
+        ;   /* reintenta si una senal interrumpe la espera (EINTR) */
+}
+ 
+static void shared_unlock(void)
+{
+    sem_post(&shared->lock);
+}
+ 
+/* Crea la region compartida e inicializa el semaforo (solo el Box). */
+static void shared_init(void)
+{
+    shared = mmap(NULL, sizeof(shared_t), PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+    if (sem_init(&shared->lock, 1, 1) < 0) {   /* 1 = compartido entre procesos */
+        perror("sem_init");
+        exit(1);
+    }
+}
+ 
+/* Pone los contadores en cero al iniciar una solicitud nueva. */
+static void shared_reset(void)
+{
+    shared_lock();
+    shared->total_created = 0;
+    shared->active = 0;
+    shared->max_level = 0;
+    memset(shared->level_count, 0, sizeof(shared->level_count));
+    shared_unlock();
+}
+ 
+/* Un Meeseeks nuevo se anota en los contadores globales. */
+static void shared_register(int level)
+{
+    int idx = (level > MAX_LEVELS) ? MAX_LEVELS : level;
+    shared_lock();
+    shared->total_created++;
+    shared->active++;
+    shared->level_count[idx]++;
+    if (level > shared->max_level)
+        shared->max_level = level;
+    shared_unlock();
+}
+ 
+/* Un Meeseeks que desaparece se resta de los activos. */
+static void shared_unregister(void)
+{
+    shared_lock();
+    shared->active--;
+    shared_unlock();
+}
+ 
+/* Copia de forma segura los contadores actuales. */
+static void shared_snapshot(int *total, int *active, int *max_level)
+{
+    shared_lock();
+    *total     = shared->total_created;
+    *active    = shared->active;
+    *max_level = shared->max_level;
+    shared_unlock();
+}
+ 
+/* Libera el semaforo y la memoria compartida (solo el Box, al terminar). */
+static void shared_cleanup(void)
+{
+    sem_destroy(&shared->lock);
+    munmap(shared, sizeof(shared_t));
+    shared = NULL;
+}
  
 /* ---------------------------------------------------------------------------
  * now_seconds: tiempo monotono en segundos (para medir duraciones reales)
@@ -104,6 +207,26 @@ static void meeseeks_say(const char *msg)
 }
  
 /* ---------------------------------------------------------------------------
+ * meeseeks_start: el Meeseeks se anota en la memoria compartida y da su
+ * mensaje de bienvenida. Debe ser lo primero que hace cada Meeseeks.
+ * ------------------------------------------------------------------------- */
+static void meeseeks_start(int level, int instance)
+{
+    shared_register(level);
+    meeseeks_greet(level, instance);
+}
+ 
+/* ---------------------------------------------------------------------------
+ * meeseeks_exit: el Meeseeks desaparece. Se resta de los activos y termina.
+ * ------------------------------------------------------------------------- */
+static void meeseeks_exit(int code)
+{
+    shared_unregister();
+    fflush(stdout);
+    _exit(code);
+}
+ 
+/* ---------------------------------------------------------------------------
  * split_args: parte una linea en palabras separadas por espacios.
  * Modifica 'line'. Llena argv terminado en NULL. Devuelve la cantidad.
  * ------------------------------------------------------------------------- */
@@ -131,13 +254,13 @@ static void meeseeks_run_program(const char *payload)
     char *argv[MAX_ARGS];
     char  msg[MAX_REQ + 64];
  
-    meeseeks_greet(1, 1);
+    meeseeks_start(1, 1);
  
     strncpy(buf, payload, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     if (split_args(buf, argv, MAX_ARGS) == 0) {
         meeseeks_say("No me pidieron ningun programa. No puedo ayudar.");
-        _exit(1);
+        meeseeks_exit(1);
     }
  
     snprintf(msg, sizeof(msg), "Voy a ejecutar el programa: %s", argv[0]);
@@ -147,7 +270,7 @@ static void meeseeks_run_program(const char *payload)
     pid_t worker = fork();
     if (worker < 0) {
         perror("fork");
-        _exit(1);
+        meeseeks_exit(1);
     }
     if (worker == 0) {
         /* Trabajador: se convierte en el programa externo */
@@ -160,7 +283,7 @@ static void meeseeks_run_program(const char *payload)
     int status = 0;
     if (waitpid(worker, &status, 0) < 0) {
         perror("waitpid");
-        _exit(1);
+        meeseeks_exit(1);
     }
  
     int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -178,7 +301,7 @@ static void meeseeks_run_program(const char *payload)
         meeseeks_say("Solicitud completada. Gracias por dejarme servirle. Adios!");
     else
         meeseeks_say("No pude completar la solicitud. Adios!");
-    _exit(ok ? 0 : 1);
+    meeseeks_exit(ok ? 0 : 1);
 }
  
 /* ===========================================================================
@@ -291,7 +414,7 @@ static void meeseeks_calc(const char *payload)
     char msg[MAX_CALC_OUT + 128];
     char out[MAX_CALC_OUT];
  
-    meeseeks_greet(1, 1);
+    meeseeks_start(1, 1);
  
     snprintf(msg, sizeof(msg), "Voy a calcular: %s", payload);
     meeseeks_say(msg);
@@ -300,13 +423,13 @@ static void meeseeks_calc(const char *payload)
         snprintf(msg, sizeof(msg), "Error en la expresion: %s", out);
         meeseeks_say(msg);
         meeseeks_say("No pude completar la solicitud. Adios!");
-        _exit(1);
+        meeseeks_exit(1);
     }
  
     snprintf(msg, sizeof(msg), "Resultado = %s", out);
     meeseeks_say(msg);
     meeseeks_say("Solicitud completada. Gracias por dejarme servirle. Adios!");
-    _exit(0);
+    meeseeks_exit(0);
 }
  
 /* ---------------------------------------------------------------------------
@@ -322,6 +445,7 @@ static int handle_request(req_type_t type, const char *payload, int *meeseeks_cr
         return 1;
     }
  
+    shared_reset();
     fflush(stdout);
     pid_t pid = fork();
     if (pid < 0) {
@@ -337,9 +461,14 @@ static int handle_request(req_type_t type, const char *payload, int *meeseeks_cr
         _exit(1);
     }
  
-    *meeseeks_created = 1;
     int status = 0;
     waitpid(pid, &status, 0);
+ 
+    int total, active, max_level;
+    shared_snapshot(&total, &active, &max_level);
+    *meeseeks_created = total;
+    printf("[Box %d] Meeseeks creados: %d | activos: %d | nivel maximo: %d\n",
+           getpid(), total, active, max_level);
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
  
@@ -365,6 +494,8 @@ static void print_report(void)
 int main(void)
 {
     char line[MAX_REQ];
+ 
+    shared_init();
  
     printf("Box de Mr. Meeseeks (pid %d)\n", getpid());
     printf("Escriba una solicitud, 'calc:<expresion>', 'run:<programa>' o 'salir'.\n");
@@ -399,6 +530,7 @@ int main(void)
         task_count++;
     }
  
+    shared_cleanup();
     print_report();
     return 0;
 }
