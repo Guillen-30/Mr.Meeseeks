@@ -25,6 +25,7 @@
  *   Paso 6: creacion recursiva de Meeseeks, solicitud por pipe, reparto de trabajo y limite de Meeseeks.
  *   Paso 7: resultado hacia el padre por pipe, orden de terminar a los hermanos, y despedida en cadena hasta el Meeseeks original.
  *   Paso 8: tiempo maximo (caos planetario) y modo de medicion de tiempo extra.
+ *   Paso 9: salida CSV (-o) con una fila por solicitud, para los experimentos.
  * ============================================================================
  */
  
@@ -64,6 +65,9 @@ typedef struct {
     double     sim_wait;    /* segundos de espera simulada descontados */
     double     overtime;    /* segundos que se paso del tiempo maximo (modo -N) */
     int        chaos;       /* 1 = el caos planetario la elimino */
+    int        max_level;   /* nivel N mas profundo que se alcanzo */
+    int        terminated;  /* Meeseeks mandados a desaparecer por orden */
+    double     difficulty;  /* dificultad real de la solicitud (-1 si no aplica) */
     int        completed;   /* 1 = terminada, 0 = no */
     int        meeseeks;    /* cantidad de Meeseeks creados */
 } task_t;
@@ -161,6 +165,7 @@ typedef struct {
     int   active;                        /* Meeseeks vivos en este momento */
     int   max_level;                     /* nivel N mas profundo alcanzado */
     int   terminated;                    /* Meeseeks mandados a desaparecer antes de terminar */
+    double difficulty;                   /* dificultad de la solicitud (la fija el primer Meeseeks) */
     double sim_wait;                     /* espera simulada (s) a descontar del tiempo real */
     int   level_count[MAX_LEVELS + 1];   /* Meeseeks creados por nivel */
 } shared_t;
@@ -202,6 +207,7 @@ static void shared_reset(void)
     shared->active = 0;
     shared->max_level = 0;
     shared->terminated = 0;
+    shared->difficulty = -1;
     shared->sim_wait = 0;
     memset(shared->level_count, 0, sizeof(shared->level_count));
     shared_unlock();
@@ -250,6 +256,14 @@ static void shared_unregister(void)
     shared_unlock();
 }
  
+/* El primer Meeseeks anota la dificultad de la solicitud (dada o al azar). */
+static void shared_set_difficulty(double d)
+{
+    shared_lock();
+    shared->difficulty = d;
+    shared_unlock();
+}
+ 
 /* Un Meeseeks se despide por orden de su padre (no por haber terminado). */
 static void shared_note_terminated(void)
 {
@@ -269,11 +283,12 @@ static void shared_note_wait(double seconds)
  
 /* Copia de forma segura los contadores actuales. */
 static void shared_snapshot(int *total, int *active, int *max_level,
-                            int *terminated, double *sim_wait,
+                            int *terminated, double *sim_wait, double *difficulty,
                             char *levels, size_t levels_size)
 {
     shared_lock();
     *terminated = shared->terminated;
+    *difficulty = shared->difficulty;
     *total     = shared->total_created;
     *active    = shared->active;
     *max_level = shared->max_level;
@@ -828,6 +843,9 @@ static void meeseeks_text(const job_t *job, int down_fd, int up_fd)
              impossible ? " IMPOSIBLE" : "");
     meeseeks_say(msg);
  
+    if (level == 1)
+        shared_set_difficulty(d);     /* queda en el informe y en el CSV */
+ 
     /* --- tiempo de simulacion (atento a una orden de terminar) --- */
     double w = job->wait;
     if (w < 0)
@@ -1157,6 +1175,9 @@ static int handle_request(req_type_t type, const char *payload, task_t *t)
     t->sim_wait = 0;
     t->overtime = 0;
     t->chaos    = 0;
+    t->max_level  = 0;
+    t->terminated = 0;
+    t->difficulty = -1;
  
     if (type == REQ_TEXT) {
         if (!parse_text_options(payload, &opts))
@@ -1206,8 +1227,10 @@ static int handle_request(req_type_t type, const char *payload, task_t *t)
     int  total, active, max_level, terminated;
     char levels[256];
     shared_snapshot(&total, &active, &max_level, &terminated, &t->sim_wait,
-                    levels, sizeof(levels));
-    t->meeseeks = total;
+                    &t->difficulty, levels, sizeof(levels));
+    t->meeseeks   = total;
+    t->max_level  = max_level;
+    t->terminated = terminated;
     if (t->chaos)
         printf("[Box %d] Meeseeks creados: %d (%s) | eliminados por el caos: %d | terminados por orden: %d | nivel maximo: %d\n",
                getpid(), total, levels, active, terminated, max_level);
@@ -1247,14 +1270,46 @@ static void print_report(void)
     printf("===================================\n");
 }
  
+/* ---------------------------------------------------------------------------
+ * Salida CSV (opcion -o): una fila por solicitud, para analizar los
+ * experimentos con herramientas como awk. La solicitud se limpia (comas y
+ * comillas) para que el archivo se pueda separar por comas sin ambiguedad.
+ * ------------------------------------------------------------------------- */
+static FILE *csv_file = NULL;
+ 
+#define CSV_HEADER "id,tipo,solicitud,dificultad,duracion_real_s,espera_simulada_s," \
+                   "estado,meeseeks,nivel_max,terminados,exceso_s,factor," \
+                   "limite_meeseeks,tiempo_max_s\n"
+ 
+static void write_csv_row(int id, const task_t *t)
+{
+    static const char *type_names[] = { "texto", "calc", "run" };
+    char   req[MAX_REQ];
+    size_t j = 0;
+ 
+    for (size_t i = 0; t->request[i] != '\0' && j + 1 < sizeof(req); i++) {
+        char c = t->request[i];
+        req[j++] = (c == ',') ? ';' : (c == '"' || c == '\n') ? '\'' : c;
+    }
+    req[j] = '\0';
+ 
+    const char *state = t->chaos ? "CAOS" : t->completed ? "TERMINADA" : "NO_TERMINADA";
+    fprintf(csv_file, "%d,%s,%s,%.2f,%.6f,%.6f,%s,%d,%d,%d,%.6f,%.2f,%d,%.0f\n",
+            id, type_names[t->type], req, t->difficulty, t->duration, t->sim_wait,
+            state, t->meeseeks, t->max_level, t->terminated, t->overtime,
+            coord_factor, shared->max_meeseeks, max_time);
+    fflush(csv_file);       /* que la fila quede guardada aunque el Box se interrumpa */
+}
+ 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Uso: %s [-m max_meeseeks] [-f factor_coordinacion] [-T segundos] [-N]\n"
+    fprintf(stderr, "Uso: %s [-m max_meeseeks] [-f factor_coordinacion] [-T segundos] [-N] [-o archivo.csv]\n"
                     "  -m  limite de Meeseeks por solicitud (defecto %d)\n"
                     "  -f  costo de coordinacion al repartir trabajo, 0.5 a 3.0 (defecto %.1f)\n"
                     "  -T  tiempo maximo por solicitud antes del caos planetario (defecto %.0f s)\n"
                     "  -N  al vencer el tiempo maximo no eliminar a nadie: solo avisar y medir\n"
-                    "      cuanto tiempo adicional necesita la solicitud\n",
+                    "      cuanto tiempo adicional necesita la solicitud\n"
+                    "  -o  guardar una fila CSV por solicitud (para los experimentos)\n",
             prog, DEFAULT_MAX_MEESEEKS, DEFAULT_COORD_FACTOR, DEFAULT_MAX_TIME);
 }
  
@@ -1263,8 +1318,9 @@ int main(int argc, char **argv)
     char line[MAX_REQ];
     int  max_meeseeks = DEFAULT_MAX_MEESEEKS;
     int  opt;
+    const char *csv_path = NULL;
  
-    while ((opt = getopt(argc, argv, "m:f:T:N")) != -1) {
+    while ((opt = getopt(argc, argv, "m:f:T:No:")) != -1) {
         switch (opt) {
         case 'm':
             max_meeseeks = atoi(optarg);
@@ -1290,6 +1346,9 @@ int main(int argc, char **argv)
         case 'N':
             kill_on_timeout = 0;
             break;
+        case 'o':
+            csv_path = optarg;
+            break;
         default:
             usage(argv[0]);
             return 1;
@@ -1297,6 +1356,17 @@ int main(int argc, char **argv)
     }
  
     shared_init(max_meeseeks);
+ 
+    if (csv_path != NULL) {
+        csv_file = fopen(csv_path, "a");     /* "a": varias corridas pueden sumar al mismo archivo */
+        if (csv_file == NULL) {
+            perror(csv_path);
+            return 1;
+        }
+        fseek(csv_file, 0, SEEK_END);
+        if (ftell(csv_file) == 0)
+            fputs(CSV_HEADER, csv_file);
+    }
     signal(SIGPIPE, SIG_IGN);   /* escribir a un Meeseeks que ya se fue no debe matarnos */
     prctl(PR_SET_CHILD_SUBREAPER, 1);   /* los Meeseeks huerfanos del caos pasan a ser del Box */
     signal(SIGINT, on_interrupt);
@@ -1341,6 +1411,8 @@ int main(int argc, char **argv)
             t->duration = 0;
  
         task_count++;
+        if (csv_file != NULL)
+            write_csv_row(task_count, t);
  
         if (t->chaos) {
             printf("\n[Box %d] El caos planetario obliga a terminar el programa.\n", getpid());
@@ -1348,6 +1420,8 @@ int main(int argc, char **argv)
         }
     }
  
+    if (csv_file != NULL)
+        fclose(csv_file);
     shared_cleanup();
     print_report();
     return 0;
