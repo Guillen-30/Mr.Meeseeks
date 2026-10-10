@@ -24,10 +24,12 @@
  *   Paso 5: texto libre con dificultad, espera simulada y caso facil (>85).
  *   Paso 6: creacion recursiva de Meeseeks, solicitud por pipe, reparto de trabajo y limite de Meeseeks.
  *   Paso 7: resultado hacia el padre por pipe, orden de terminar a los hermanos, y despedida en cadena hasta el Meeseeks original.
+ *   Paso 8: tiempo maximo (caos planetario) y modo de medicion de tiempo extra.
  * ============================================================================
  */
  
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
@@ -39,6 +41,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <semaphore.h>
  
 #define MAX_ARGS    32    /* maximo de argumentos de un programa externo */
@@ -59,6 +62,8 @@ typedef struct {
     req_type_t type;
     double     duration;    /* segundos reales de ejecucion (sin espera simulada) */
     double     sim_wait;    /* segundos de espera simulada descontados */
+    double     overtime;    /* segundos que se paso del tiempo maximo (modo -N) */
+    int        chaos;       /* 1 = el caos planetario la elimino */
     int        completed;   /* 1 = terminada, 0 = no */
     int        meeseeks;    /* cantidad de Meeseeks creados */
 } task_t;
@@ -109,12 +114,25 @@ typedef struct {
  * sus resultados al padre por up_fd (de escritura). */
 typedef void (*meeseeks_body_t)(const job_t *job, int down_fd, int up_fd);
  
-static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h);
+static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h,
+                         int new_group);
  
 #define DEFAULT_MAX_MEESEEKS 100   /* limite de Meeseeks por solicitud (-m) */
 #define DEFAULT_COORD_FACTOR 1.5   /* costo de coordinacion al repartir (-f) */
  
 static double coord_factor = DEFAULT_COORD_FACTOR;
+ 
+/* --- Tiempo maximo ("caos planetario") ---
+ * Si una solicitud tarda mas de max_time segundos reales (la espera simulada
+ * tambien cuenta, porque es tiempo real que transcurre), el Box decreta el
+ * caos planetario: elimina a todos los Meeseeks de la solicitud y cierra el
+ * programa. Con la opcion -N el Box solo avisa y sigue esperando, para medir
+ * cuanto tiempo adicional necesita la solicitud para terminar. */
+#define DEFAULT_MAX_TIME 300.0     /* 5 minutos (-T para cambiarlo) */
+ 
+static double max_time = DEFAULT_MAX_TIME;
+static int    kill_on_timeout = 1;               /* 0 con la opcion -N */
+static volatile sig_atomic_t current_pgid = 0;   /* grupo de la solicitud en curso */
  
 /* ===========================================================================
  * MEMORIA COMPARTIDA Y SEMAFORO
@@ -394,6 +412,13 @@ static void meeseeks_run_program(const job_t *job, int down_fd, int up_fd)
     }
     if (worker == 0) {
         /* Trabajador: se convierte en el programa externo */
+        /* El programa externo no debe leer del teclado del Box (ni quedar
+         * detenido por estar en otro grupo de procesos) */
+        int nul = open("/dev/null", O_RDONLY);
+        if (nul >= 0) {
+            dup2(nul, STDIN_FILENO);
+            close(nul);
+        }
         signal(SIGPIPE, SIG_DFL);   /* el programa externo la espera normal */
         execvp(argv[0], argv);
         perror("execvp");
@@ -867,7 +892,7 @@ static void meeseeks_text(const job_t *job, int down_fd, int up_fd)
         child.impossible = impossible;
         snprintf(child.text, sizeof(child.text), "%s", job->text);
  
-        if (spawn_meeseeks(meeseeks_text, &child, &kids[created]) < 0) {
+        if (spawn_meeseeks(meeseeks_text, &child, &kids[created], 0) < 0) {
             shared_release(level + 1);    /* no nacio: devuelve la reserva */
             continue;
         }
@@ -969,8 +994,14 @@ static void meeseeks_text(const job_t *job, int down_fd, int up_fd)
  * hermanos y del padre), asi cada pipe tiene solo los extremos que corresponden
  * y se puede detectar cuando alguien desaparece. El hijo ejecuta 'body' y
  * nunca regresa. Devuelve 0 si todo salio bien, -1 si fallo.
+ *
+ * Si new_group es 1 (solo el primer Meeseeks de cada solicitud), el nuevo
+ * proceso pasa a ser lider de un grupo de procesos propio. Todos sus
+ * descendientes heredan ese grupo, asi el Box puede eliminar el arbol
+ * completo con un solo kill(-grupo) si se decreta el caos planetario.
  * ------------------------------------------------------------------------- */
-static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h)
+static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h,
+                         int new_group)
 {
     int down[2], up[2];
  
@@ -995,6 +1026,8 @@ static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h)
     if (pid == 0) {
         /* Hijo: se queda solo con su extremo de lectura de ordenes y su
          * extremo de escritura de resultados */
+        if (new_group)
+            setpgid(0, 0);
         int my_down = down[0], my_up = up[1];
         for (int fd = 3; fd < 64; fd++)
             if (fd != my_down && fd != my_up)
@@ -1010,6 +1043,9 @@ static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h)
     /* Padre: se queda con los extremos opuestos */
     close(down[0]);
     close(up[1]);
+    if (new_group)
+        setpgid(pid, pid);   /* antes de enviar el trabajo: el grupo existe
+                              * antes de que el hijo cree a nadie */
     h->pid        = pid;
     h->to_child   = down[1];
     h->from_child = up[0];
@@ -1018,14 +1054,94 @@ static int spawn_meeseeks(meeseeks_body_t body, const job_t *job, helper_t *h)
 }
  
 /* ---------------------------------------------------------------------------
+ * wait_with_deadline: el Box espera al primer Meeseeks, pero no mas de
+ * max_time segundos desde 'started'. Devuelve 1 si el Meeseeks termino
+ * (estado en *status), 0 si se decreto el caos planetario.
+ *
+ * Con -N (kill_on_timeout = 0) no se elimina a nadie: se avisa una vez, se
+ * sigue esperando y se anota en t->overtime cuanto se paso del limite.
+ *
+ * La espera es exacta y sin consultas periodicas: SIGCHLD se bloquea y
+ * sigtimedwait() duerme hasta que el hijo termine o venza el plazo. Como la
+ * senal queda pendiente aunque llegue antes de dormir, no hay carreras.
+ * ------------------------------------------------------------------------- */
+static int wait_with_deadline(pid_t pid, int *status, double started, task_t *t)
+{
+    sigset_t set, old;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &set, &old);
+ 
+    double deadline = started + max_time;
+    int finished = 0;
+ 
+    for (;;) {
+        pid_t r = waitpid(pid, status, WNOHANG);
+        if (r == pid) {
+            finished = 1;
+            break;
+        }
+ 
+        double remaining = deadline - now_seconds();
+        if (remaining <= 0) {
+            printf("[Box %d] CAOS PLANETARIO: pasaron %.0f s y la solicitud no termina.\n",
+                   getpid(), max_time);
+            fflush(stdout);
+            if (kill_on_timeout)
+                break;                          /* finished = 0: hay que eliminar a todos */
+            printf("[Box %d] Modo -N: sigo esperando para medir el tiempo adicional...\n",
+                   getpid());
+            fflush(stdout);
+            while (waitpid(pid, status, 0) < 0 && errno == EINTR)
+                ;
+            t->overtime = now_seconds() - deadline;
+            finished = 1;
+            break;
+        }
+ 
+        struct timespec ts;
+        ts.tv_sec  = (time_t)remaining;
+        ts.tv_nsec = (long)((remaining - (double)ts.tv_sec) * 1e9);
+        sigtimedwait(&set, NULL, &ts);          /* despierta con SIGCHLD o al vencer */
+    }
+ 
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    return finished;
+}
+ 
+/* Espera a todos los procesos hijo que queden (el Box es "subreaper": los
+ * Meeseeks huerfanos del caos pasan a ser suyos). Termina cuando no queda ninguno. */
+static void reap_all_children(void)
+{
+    int st;
+    for (;;) {
+        pid_t r = waitpid(-1, &st, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;      /* ECHILD: ya no queda ninguno */
+        }
+    }
+}
+ 
+/* Si el usuario interrumpe el Box (Ctrl-C), no deben quedar Meeseeks vivos:
+ * estan en otro grupo de procesos y no reciben la senal del teclado. */
+static void on_interrupt(int sig)
+{
+    (void)sig;
+    if (current_pgid > 0)
+        kill(-current_pgid, SIGKILL);
+    _exit(130);
+}
+ 
+/* ---------------------------------------------------------------------------
  * handle_request: punto de entrada para atender una solicitud.
  * Arma el mensaje, crea el primer Meeseeks (nivel 1, instancia 1) y espera a
- * que termine todo su arbol de ayudantes. Devuelve 1 si la tarea se completo,
- * 0 si no. Llena la cantidad de Meeseeks creados y la espera simulada (para
- * descontarla del tiempo real).
+ * que termine todo su arbol de ayudantes, dentro del tiempo maximo. Devuelve
+ * 1 si la tarea se completo, 0 si no. Llena en 't' la cantidad de Meeseeks
+ * creados, la espera simulada (para descontarla del tiempo real), el tiempo
+ * extra (modo -N) y si el caos planetario la elimino.
  * ------------------------------------------------------------------------- */
-static int handle_request(req_type_t type, const char *payload,
-                          int *meeseeks_created, double *sim_wait)
+static int handle_request(req_type_t type, const char *payload, task_t *t)
 {
     text_opts_t     opts;
     job_t           job;
@@ -1037,8 +1153,10 @@ static int handle_request(req_type_t type, const char *payload,
     job.instance = 1;
     job.work     = -1;      /* al azar, salvo que el usuario fije la dificultad */
     job.wait     = -1;
-    *meeseeks_created = 0;
-    *sim_wait = 0;
+    t->meeseeks = 0;
+    t->sim_wait = 0;
+    t->overtime = 0;
+    t->chaos    = 0;
  
     if (type == REQ_TEXT) {
         if (!parse_text_options(payload, &opts))
@@ -1059,24 +1177,47 @@ static int handle_request(req_type_t type, const char *payload,
     shared_reserve(1, 1);               /* el primer Meeseeks */
  
     helper_t first;
-    if (spawn_meeseeks(body, &job, &first) < 0) {
+    double started = now_seconds();
+    if (spawn_meeseeks(body, &job, &first, 1) < 0) {
         shared_release(1);
         return 0;
     }
+    current_pgid = first.pid;           /* grupo de procesos de esta solicitud */
  
     int status = 0;
-    waitpid(first.pid, &status, 0);
+    int finished = wait_with_deadline(first.pid, &status, started, t);
+ 
+    if (!finished) {
+        /* Caos planetario: el Box termina a todos los procesos hijos */
+        printf("[Box %d] Termino a todos los Meeseeks de la solicitud y cierro el programa.\n",
+               getpid());
+        fflush(stdout);
+        kill(-first.pid, SIGKILL);
+        reap_all_children();
+        /* Un Meeseeks pudo morir justo con el semaforo tomado: se reinicia */
+        sem_destroy(&shared->lock);
+        sem_init(&shared->lock, 1, 1);
+        t->chaos = 1;
+    }
+    current_pgid = 0;
     close(first.to_child);
     close(first.from_child);
  
     int  total, active, max_level, terminated;
     char levels[256];
-    shared_snapshot(&total, &active, &max_level, &terminated, sim_wait,
+    shared_snapshot(&total, &active, &max_level, &terminated, &t->sim_wait,
                     levels, sizeof(levels));
-    *meeseeks_created = total;
-    printf("[Box %d] Meeseeks creados: %d (%s) | terminados por orden: %d | activos: %d | nivel maximo: %d | espera simulada: %.3f s\n",
-           getpid(), total, levels, terminated, active, max_level, *sim_wait);
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    t->meeseeks = total;
+    if (t->chaos)
+        printf("[Box %d] Meeseeks creados: %d (%s) | eliminados por el caos: %d | terminados por orden: %d | nivel maximo: %d\n",
+               getpid(), total, levels, active, terminated, max_level);
+    else
+        printf("[Box %d] Meeseeks creados: %d (%s) | terminados por orden: %d | activos: %d | nivel maximo: %d | espera simulada: %.3f s\n",
+               getpid(), total, levels, terminated, active, max_level, t->sim_wait);
+    if (t->overtime > 0)
+        printf("[Box %d] La solicitud termino %.3f s despues del tiempo maximo.\n",
+               getpid(), t->overtime);
+    return finished && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
  
 /* ---------------------------------------------------------------------------
@@ -1084,26 +1225,37 @@ static int handle_request(req_type_t type, const char *payload,
  * ------------------------------------------------------------------------- */
 static void print_report(void)
 {
-    int done = 0;
+    int done = 0, chaos = 0;
     printf("\n========== INFORME FINAL ==========\n");
     printf("Tareas solicitadas: %d\n", task_count);
     for (int i = 0; i < task_count; i++) {
-        printf("%3d. \"%s\" | duracion real: %.3f s | espera simulada: %.3f s | %s | Meeseeks: %d\n",
+        const char *status = tasks[i].chaos     ? "CAOS PLANETARIO"
+                           : tasks[i].completed ? "TERMINADA"
+                                                : "NO TERMINADA";
+        char extra[80] = "";
+        if (tasks[i].overtime > 0)
+            snprintf(extra, sizeof(extra), " | excedio el tiempo maximo por %.3f s",
+                     tasks[i].overtime);
+        printf("%3d. \"%s\" | duracion real: %.3f s | espera simulada: %.3f s | %s | Meeseeks: %d%s\n",
                i + 1, tasks[i].request, tasks[i].duration, tasks[i].sim_wait,
-               tasks[i].completed ? "TERMINADA" : "NO TERMINADA",
-               tasks[i].meeseeks);
+               status, tasks[i].meeseeks, extra);
         if (tasks[i].completed) done++;
+        if (tasks[i].chaos)     chaos++;
     }
-    printf("Terminadas: %d | No terminadas: %d\n", done, task_count - done);
+    printf("Terminadas: %d | No terminadas: %d (por caos planetario: %d)\n",
+           done, task_count - done, chaos);
     printf("===================================\n");
 }
  
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Uso: %s [-m max_meeseeks] [-f factor_coordinacion]\n"
+    fprintf(stderr, "Uso: %s [-m max_meeseeks] [-f factor_coordinacion] [-T segundos] [-N]\n"
                     "  -m  limite de Meeseeks por solicitud (defecto %d)\n"
-                    "  -f  costo de coordinacion al repartir trabajo, 0.5 a 3.0 (defecto %.1f)\n",
-            prog, DEFAULT_MAX_MEESEEKS, DEFAULT_COORD_FACTOR);
+                    "  -f  costo de coordinacion al repartir trabajo, 0.5 a 3.0 (defecto %.1f)\n"
+                    "  -T  tiempo maximo por solicitud antes del caos planetario (defecto %.0f s)\n"
+                    "  -N  al vencer el tiempo maximo no eliminar a nadie: solo avisar y medir\n"
+                    "      cuanto tiempo adicional necesita la solicitud\n",
+            prog, DEFAULT_MAX_MEESEEKS, DEFAULT_COORD_FACTOR, DEFAULT_MAX_TIME);
 }
  
 int main(int argc, char **argv)
@@ -1112,7 +1264,7 @@ int main(int argc, char **argv)
     int  max_meeseeks = DEFAULT_MAX_MEESEEKS;
     int  opt;
  
-    while ((opt = getopt(argc, argv, "m:f:")) != -1) {
+    while ((opt = getopt(argc, argv, "m:f:T:N")) != -1) {
         switch (opt) {
         case 'm':
             max_meeseeks = atoi(optarg);
@@ -1128,6 +1280,16 @@ int main(int argc, char **argv)
                 return 1;
             }
             break;
+        case 'T':
+            max_time = atof(optarg);
+            if (max_time <= 0) {
+                usage(argv[0]);
+                return 1;
+            }
+            break;
+        case 'N':
+            kill_on_timeout = 0;
+            break;
         default:
             usage(argv[0]);
             return 1;
@@ -1136,10 +1298,16 @@ int main(int argc, char **argv)
  
     shared_init(max_meeseeks);
     signal(SIGPIPE, SIG_IGN);   /* escribir a un Meeseeks que ya se fue no debe matarnos */
+    prctl(PR_SET_CHILD_SUBREAPER, 1);   /* los Meeseeks huerfanos del caos pasan a ser del Box */
+    signal(SIGINT, on_interrupt);
+    signal(SIGTERM, on_interrupt);
  
     printf("Box de Mr. Meeseeks (pid %d)\n", getpid());
     printf("Limite de Meeseeks por solicitud: %d | factor de coordinacion: %.2f\n",
            max_meeseeks, coord_factor);
+    printf("Tiempo maximo por solicitud: %.0f s (%s)\n", max_time,
+           kill_on_timeout ? "luego se decreta el caos planetario"
+                           : "modo -N: solo se avisa y se mide el tiempo extra");
     printf("Escriba una solicitud, 'calc:<expresion>', 'run:<programa>' o 'salir'.\n");
  
     while (1) {
@@ -1166,13 +1334,18 @@ int main(int argc, char **argv)
         t->type = type;
  
         double start = now_seconds();
-        t->completed = handle_request(type, payload, &t->meeseeks, &t->sim_wait);
+        t->completed = handle_request(type, payload, t);
         /* Tiempo real = tiempo total menos la espera aleatoria de la simulacion */
         t->duration = now_seconds() - start - t->sim_wait;
         if (t->duration < 0)
             t->duration = 0;
  
         task_count++;
+ 
+        if (t->chaos) {
+            printf("\n[Box %d] El caos planetario obliga a terminar el programa.\n", getpid());
+            break;
+        }
     }
  
     shared_cleanup();
