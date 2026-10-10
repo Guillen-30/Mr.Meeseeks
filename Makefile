@@ -5,7 +5,7 @@ TARGET = meeseeks
 all: $(TARGET)
 
 $(TARGET): meeseeks.c
-	$(CC) $(CFLAGS) -o $(TARGET) meeseeks.c
+	$(CC) $(CFLAGS) -o $(TARGET) meeseeks.c -lm
 
 clean:
 	rm -f $(TARGET)

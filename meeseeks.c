@@ -16,14 +16,16 @@
  *     - Ejecucion de un programa externo       (prefijo "run:")
  *   Escribir "salir" para despedirse y ver el informe final.
  *
-* Estado del desarrollo:
+ * Estado del desarrollo:
  *   Paso 1: esqueleto del Box, lectura de solicitudes y estadisticas.
  *   Paso 2: solicitudes "run:" (fork + exec + waitpid, con argumentos).
  *   Paso 3: solicitudes "calc:" (programa bc mediante pipes).
  *   Paso 4: memoria compartida + semaforo para contadores de Meeseeks.
+ *   Paso 5: texto libre con dificultad, espera simulada y caso facil (>85).
  * ============================================================================
  */
  
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +52,8 @@ typedef enum {
 typedef struct {
     char       request[MAX_REQ];
     req_type_t type;
-    double     duration;    /* segundos reales de ejecucion */
+    double     duration;    /* segundos reales de ejecucion (sin espera simulada) */
+    double     sim_wait;    /* segundos de espera simulada descontados */
     int        completed;   /* 1 = terminada, 0 = no */
     int        meeseeks;    /* cantidad de Meeseeks creados */
 } task_t;
@@ -77,6 +80,7 @@ typedef struct {
     int   total_created;                 /* Meeseeks creados en la solicitud actual */
     int   active;                        /* Meeseeks vivos en este momento */
     int   max_level;                     /* nivel N mas profundo alcanzado */
+    double sim_wait;                     /* espera simulada (s) a descontar del tiempo real */
     int   level_count[MAX_LEVELS + 1];   /* instancias creadas por nivel */
 } shared_t;
  
@@ -115,6 +119,7 @@ static void shared_reset(void)
     shared->total_created = 0;
     shared->active = 0;
     shared->max_level = 0;
+    shared->sim_wait = 0;
     memset(shared->level_count, 0, sizeof(shared->level_count));
     shared_unlock();
 }
@@ -140,13 +145,24 @@ static void shared_unregister(void)
     shared_unlock();
 }
  
+/* Registra el tiempo de espera simulado (conserva el mayor). */
+static void shared_note_wait(double seconds)
+{
+    shared_lock();
+    if (seconds > shared->sim_wait)
+        shared->sim_wait = seconds;
+    shared_unlock();
+}
+ 
 /* Copia de forma segura los contadores actuales. */
-static void shared_snapshot(int *total, int *active, int *max_level)
+static void shared_snapshot(int *total, int *active, int *max_level,
+                            double *sim_wait)
 {
     shared_lock();
     *total     = shared->total_created;
     *active    = shared->active;
     *max_level = shared->max_level;
+    *sim_wait  = shared->sim_wait;
     shared_unlock();
 }
  
@@ -432,32 +448,167 @@ static void meeseeks_calc(const char *payload)
     meeseeks_exit(0);
 }
  
+/* ===========================================================================
+ * TEXTO LIBRE (parte A): simulacion con dificultad
+ * ========================================================================= */
+ 
+#define MAX_USER_WAIT   300.0   /* tiempo de simulacion maximo que puede fijar el usuario */
+#define EASY_THRESHOLD   85.0   /* dificultad > 85: lo resuelve un solo Meeseeks */
+ 
+/* Opciones de una solicitud de texto. -1 significa "al azar". */
+typedef struct {
+    double      difficulty;     /* 0 a 100, o -1 */
+    double      wait;           /* segundos de simulacion, o -1 */
+    const char *text;           /* solicitud sin el prefijo */
+} text_opts_t;
+ 
+/* ---------------------------------------------------------------------------
+ * parse_text_options: lee el prefijo opcional "dif=<0-100>,t=<seg>:".
+ * Devuelve 1 si es valido, 0 si hay error (ya avisado al usuario).
+ * ------------------------------------------------------------------------- */
+static int parse_text_options(const char *payload, text_opts_t *o)
+{
+    o->difficulty = -1;
+    o->wait = -1;
+    o->text = payload;
+ 
+    if (strncmp(payload, "dif=", 4) == 0 || strncmp(payload, "t=", 2) == 0) {
+        const char *colon = strchr(payload, ':');
+        char hdr[64];
+        if (colon == NULL || (size_t)(colon - payload) >= sizeof(hdr)) {
+            printf("[Box %d] Formato: dif=<0-100>,t=<seg>: <solicitud>\n", getpid());
+            return 0;
+        }
+        memcpy(hdr, payload, (size_t)(colon - payload));
+        hdr[colon - payload] = '\0';
+ 
+        for (char *tok = strtok(hdr, ","); tok != NULL; tok = strtok(NULL, ",")) {
+            char *end;
+            if (strncmp(tok, "dif=", 4) == 0) {
+                double v = strtod(tok + 4, &end);
+                if (end == tok + 4 || *end != '\0' || v < 0 || v > 100) {
+                    printf("[Box %d] La dificultad debe estar entre 0 y 100.\n", getpid());
+                    return 0;
+                }
+                o->difficulty = v;
+            } else if (strncmp(tok, "t=", 2) == 0) {
+                double v = strtod(tok + 2, &end);
+                if (end == tok + 2 || *end != '\0' || v < 0 || v > MAX_USER_WAIT) {
+                    printf("[Box %d] El tiempo debe estar entre 0 y %.0f segundos.\n",
+                           getpid(), MAX_USER_WAIT);
+                    return 0;
+                }
+                o->wait = v;
+            } else {
+                printf("[Box %d] Opcion desconocida: %s (use dif= o t=)\n", getpid(), tok);
+                return 0;
+            }
+        }
+        o->text = colon + 1;
+        while (*o->text == ' ' || *o->text == '\t')
+            o->text++;
+    }
+ 
+    if (o->text[0] == '\0') {
+        printf("[Box %d] La solicitud esta vacia.\n", getpid());
+        return 0;
+    }
+    return 1;
+}
+ 
+/* ---------------------------------------------------------------------------
+ * random_difficulty: dificultad al azar con distribucion normal (Box-Muller),
+ * media 50 y desviacion 25, recortada al rango [0, 100]. Asi hay pocas tareas
+ * imposibles o muy faciles y muchas de dificultad media.
+ * ------------------------------------------------------------------------- */
+static double random_difficulty(void)
+{
+    double u1 = 1.0 - drand48();   /* (0, 1], evita log(0) */
+    double u2 = drand48();
+    double z  = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+    double d  = 50.0 + 25.0 * z;
+    if (d < 0)   d = 0;
+    if (d > 100) d = 100;
+    return d;
+}
+ 
+/* ---------------------------------------------------------------------------
+ * meeseeks_text: cuerpo del Meeseeks que atiende una solicitud de texto.
+ * Paso 5: solo el caso facil (dificultad > 85) se resuelve. Para dificultad
+ * menor, el Meeseeks avisa que necesita ayuda (se implementa en el paso 6).
+ * ------------------------------------------------------------------------- */
+static void meeseeks_text(const text_opts_t *opts)
+{
+    char msg[MAX_REQ + 160];
+ 
+    meeseeks_start(1, 1);
+    /* Cada proceso necesita su propia semilla: si no, todos darian lo mismo */
+    srand48(time(NULL) ^ ((long)getpid() << 16));
+ 
+    snprintf(msg, sizeof(msg), "Solicitud recibida: \"%s\"", opts->text);
+    meeseeks_say(msg);
+ 
+    double d = opts->difficulty;
+    const char *origin = "definida por el usuario";
+    if (d < 0) {
+        d = random_difficulty();
+        origin = "calculada al azar";
+    }
+    snprintf(msg, sizeof(msg), "Dificultad: %.2f (%s)", d, origin);
+    meeseeks_say(msg);
+ 
+    double w = opts->wait;
+    if (w < 0)
+        w = 0.5 + drand48() * 4.5;   /* uniforme entre 0.5 y 5 s */
+    snprintf(msg, sizeof(msg), "Voy a trabajar en esto durante %.2f s...", w);
+    meeseeks_say(msg);
+ 
+    shared_note_wait(w);             /* el Box descontara este tiempo */
+    usleep((useconds_t)(w * 1e6));
+ 
+    if (d > EASY_THRESHOLD) {
+        meeseeks_say("Listo, era facil. Solicitud completada. Gracias por dejarme servirle. Adios!");
+        meeseeks_exit(0);
+    }
+ 
+    snprintf(msg, sizeof(msg),
+             "Esto es dificil (%.2f). Necesito ayuda de otros Meeseeks (pendiente: paso 6).", d);
+    meeseeks_say(msg);
+    meeseeks_say("No pude completar la solicitud. Adios!");
+    meeseeks_exit(1);
+}
+ 
 /* ---------------------------------------------------------------------------
  * handle_request: punto de entrada para atender una solicitud.
- * Devuelve 1 si la tarea se completo, 0 si no.
+ * Crea el primer Meeseeks con fork y espera a que termine. Devuelve 1 si la
+ * tarea se completo, 0 si no. Llena la cantidad de Meeseeks creados y la
+ * espera simulada (para descontarla del tiempo real).
  * ------------------------------------------------------------------------- */
-static int handle_request(req_type_t type, const char *payload, int *meeseeks_created)
+static int handle_request(req_type_t type, const char *payload,
+                          int *meeseeks_created, double *sim_wait)
 {
-    if (type == REQ_TEXT) {
-        /* El texto libre (con dificultad) se implementa en pasos posteriores */
-        printf("[Box %d] (pendiente) texto: %s\n", getpid(), payload);
-        *meeseeks_created = 0;
-        return 1;
-    }
+    text_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    *meeseeks_created = 0;
+    *sim_wait = 0;
+ 
+    if (type == REQ_TEXT && !parse_text_options(payload, &opts))
+        return 0;
  
     shared_reset();
     fflush(stdout);
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        *meeseeks_created = 0;
         return 0;
     }
     if (pid == 0) {
         if (type == REQ_CALC)
-            meeseeks_calc(payload);      /* no regresa */
-        else
+            meeseeks_calc(payload);          /* no regresa */
+        else if (type == REQ_PROG)
             meeseeks_run_program(payload);   /* no regresa */
+        else
+            meeseeks_text(&opts);            /* no regresa */
         _exit(1);
     }
  
@@ -465,10 +616,10 @@ static int handle_request(req_type_t type, const char *payload, int *meeseeks_cr
     waitpid(pid, &status, 0);
  
     int total, active, max_level;
-    shared_snapshot(&total, &active, &max_level);
+    shared_snapshot(&total, &active, &max_level, sim_wait);
     *meeseeks_created = total;
-    printf("[Box %d] Meeseeks creados: %d | activos: %d | nivel maximo: %d\n",
-           getpid(), total, active, max_level);
+    printf("[Box %d] Meeseeks creados: %d | activos: %d | nivel maximo: %d | espera simulada: %.3f s\n",
+           getpid(), total, active, max_level, *sim_wait);
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
  
@@ -481,8 +632,8 @@ static void print_report(void)
     printf("\n========== INFORME FINAL ==========\n");
     printf("Tareas solicitadas: %d\n", task_count);
     for (int i = 0; i < task_count; i++) {
-        printf("%3d. \"%s\" | duracion: %.3f s | %s | Meeseeks: %d\n",
-               i + 1, tasks[i].request, tasks[i].duration,
+        printf("%3d. \"%s\" | duracion real: %.3f s | espera simulada: %.3f s | %s | Meeseeks: %d\n",
+               i + 1, tasks[i].request, tasks[i].duration, tasks[i].sim_wait,
                tasks[i].completed ? "TERMINADA" : "NO TERMINADA",
                tasks[i].meeseeks);
         if (tasks[i].completed) done++;
@@ -524,8 +675,11 @@ int main(void)
         t->type = type;
  
         double start = now_seconds();
-        t->completed = handle_request(type, payload, &t->meeseeks);
-        t->duration = now_seconds() - start;
+        t->completed = handle_request(type, payload, &t->meeseeks, &t->sim_wait);
+        /* Tiempo real = tiempo total menos la espera aleatoria de la simulacion */
+        t->duration = now_seconds() - start - t->sim_wait;
+        if (t->duration < 0)
+            t->duration = 0;
  
         task_count++;
     }
