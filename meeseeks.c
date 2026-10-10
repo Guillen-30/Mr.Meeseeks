@@ -6,7 +6,7 @@
  * Carne:       2022123818
  * Fecha:       15 de Octubre 2026
  * Compilacion: make
- * Ejecucion:   ./meeseeks
+ * Ejecucion:   ./meeseeks [-m max_meeseeks] [-f factor_coordinacion] [-T segundos] [-N] [-o archivo.csv]
  *
  * Descripcion:
  *   Programa Box de Mr. Meeseeks. Recibe solicitudes del usuario y crea
@@ -15,6 +15,10 @@
  *     - Calculo aritmetico o logico            (prefijo "calc:")
  *     - Ejecucion de un programa externo       (prefijo "run:")
  *   Escribir "salir" para despedirse y ver el informe final.
+ *
+ *   Texto libre: se puede fijar la dificultad y el tiempo de simulacion con
+ *   un prefijo opcional:   dif=30,t=2: quiero un cafe frances
+ *   Sin prefijo, la dificultad (0-100) y el tiempo (0.5-5 s) salen al azar.
  *
  * Estado del desarrollo:
  *   Paso 1: esqueleto del Box, lectura de solicitudes y estadisticas.
