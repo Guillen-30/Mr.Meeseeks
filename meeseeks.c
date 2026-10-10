@@ -18,9 +18,11 @@
  *
  * Estado del desarrollo:
  *   Paso 1: esqueleto del Box, lectura de solicitudes y estadisticas.
+ *   Paso 2: solicitudes "run:" (fork + exec + waitpid, con argumentos).
+ *   Paso 3: solicitudes "calc:" (programa bc mediante pipes).
  * ============================================================================
  */
-
+ 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -179,15 +181,143 @@ static void meeseeks_run_program(const char *payload)
     _exit(ok ? 0 : 1);
 }
  
+/* ===========================================================================
+ * CALCULOS (solicitudes "calc:")
+ *
+ * Se usa el programa externo "bc" (calculadora estandar de Linux), tal como
+ * permite el enunciado ("escribir o buscar un pequeno programa").
+ *
+ * Comunicacion mediante pipes (sin pasar por el shell, para que el texto del
+ * usuario nunca se interprete como comandos):
+ *
+ *      Meeseeks --(pipe to_bc)-->  stdin  de bc
+ *      Meeseeks <-(pipe from_bc)-- stdout y stderr de bc
+ *
+ * Consideraciones especiales:
+ *  - bc termina con codigo 0 incluso cuando hay errores, por lo que el exito
+ *    se decide leyendo su salida (busca "error", "illegal" o "(standard_in)").
+ *  - Se envia "scale=10" primero, para que las divisiones den decimales
+ *    (por defecto bc divide como enteros: 18/74 daria 0). Los decimales se
+ *    truncan (no se redondean), por eso 28+18/74*321 da 106.0810810672.
+ *  - Excepcion: si la expresion contiene "%" se usa scale=0 (enteros), porque
+ *    bc da resultados incorrectos con modulo cuando scale > 0.
+ *  - BC_LINE_LENGTH=0 evita que bc parta en varias lineas resultados largos.
+ *  - Operadores soportados por bc: + - * / % ^, comparaciones, && || !.
+ *    Los logicos devuelven 1 (verdadero) o 0 (falso).
+ * ========================================================================= */
+ 
+#define MAX_CALC_OUT 1024
+ 
+/* ---------------------------------------------------------------------------
+ * run_bc: ejecuta bc con la expresion. Deja la salida (sin salto de linea
+ * final) en 'out'. Devuelve 1 si hubo un resultado valido, 0 si hubo error.
+ * ------------------------------------------------------------------------- */
+static int run_bc(const char *expr, char *out, size_t out_size)
+{
+    int to_bc[2], from_bc[2];
+ 
+    if (pipe(to_bc) < 0 || pipe(from_bc) < 0) {
+        perror("pipe");
+        snprintf(out, out_size, "no pude crear los pipes");
+        return 0;
+    }
+ 
+    fflush(stdout);
+    pid_t worker = fork();
+    if (worker < 0) {
+        perror("fork");
+        snprintf(out, out_size, "no pude crear el proceso de calculo");
+        return 0;
+    }
+ 
+    if (worker == 0) {
+        /* Trabajador: stdin <- to_bc, stdout y stderr -> from_bc */
+        dup2(to_bc[0], STDIN_FILENO);
+        dup2(from_bc[1], STDOUT_FILENO);
+        dup2(from_bc[1], STDERR_FILENO);
+        close(to_bc[0]);   close(to_bc[1]);
+        close(from_bc[0]); close(from_bc[1]);
+        setenv("BC_LINE_LENGTH", "0", 1);
+        execlp("bc", "bc", (char *)NULL);
+        perror("execlp bc");
+        _exit(127);
+    }
+ 
+    /* Meeseeks: manda la expresion por el pipe y cierra para que bc termine */
+    close(to_bc[0]);
+    close(from_bc[1]);
+    /* bc calcula mal "%" cuando scale > 0 (10%3 daria .0000000001), por lo
+     * que si la expresion usa modulo se trabaja con enteros (scale=0). */
+    dprintf(to_bc[1], "scale=%d\n%s\n", strchr(expr, '%') ? 0 : 10, expr);
+    close(to_bc[1]);
+ 
+    /* Lee todo lo que bc responda */
+    size_t used = 0;
+    ssize_t n;
+    while (used < out_size - 1 &&
+           (n = read(from_bc[0], out + used, out_size - 1 - used)) > 0)
+        used += (size_t)n;
+    out[used] = '\0';
+    close(from_bc[0]);
+ 
+    int status = 0;
+    waitpid(worker, &status, 0);
+ 
+    /* Quita saltos de linea finales */
+    while (used > 0 && (out[used - 1] == '\n' || out[used - 1] == '\r'))
+        out[--used] = '\0';
+ 
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(out, out_size, "no se pudo ejecutar bc (esta instalado?)");
+        return 0;
+    }
+    if (used == 0) {
+        snprintf(out, out_size, "la expresion no produjo ningun resultado");
+        return 0;
+    }
+    if (strstr(out, "error") || strstr(out, "illegal") ||
+        strstr(out, "(standard_in)"))
+        return 0;
+    return 1;
+}
+ 
+/* ---------------------------------------------------------------------------
+ * meeseeks_calc: cuerpo del Meeseeks que atiende un "calc:".
+ * Es una tarea sencilla: un solo Meeseeks (N=1, i=1) pide el calculo a bc y
+ * reporta el resultado o el error. exit 0 = completada, exit 1 = no.
+ * ------------------------------------------------------------------------- */
+static void meeseeks_calc(const char *payload)
+{
+    char msg[MAX_CALC_OUT + 128];
+    char out[MAX_CALC_OUT];
+ 
+    meeseeks_greet(1, 1);
+ 
+    snprintf(msg, sizeof(msg), "Voy a calcular: %s", payload);
+    meeseeks_say(msg);
+ 
+    if (!run_bc(payload, out, sizeof(out))) {
+        snprintf(msg, sizeof(msg), "Error en la expresion: %s", out);
+        meeseeks_say(msg);
+        meeseeks_say("No pude completar la solicitud. Adios!");
+        _exit(1);
+    }
+ 
+    snprintf(msg, sizeof(msg), "Resultado = %s", out);
+    meeseeks_say(msg);
+    meeseeks_say("Solicitud completada. Gracias por dejarme servirle. Adios!");
+    _exit(0);
+}
+ 
 /* ---------------------------------------------------------------------------
  * handle_request: punto de entrada para atender una solicitud.
  * Devuelve 1 si la tarea se completo, 0 si no.
  * ------------------------------------------------------------------------- */
 static int handle_request(req_type_t type, const char *payload, int *meeseeks_created)
 {
-    if (type != REQ_PROG) {
-        /* Texto y calculos se implementan en pasos posteriores */
-        printf("[Box %d] (pendiente) tipo %d: %s\n", getpid(), type, payload);
+    if (type == REQ_TEXT) {
+        /* El texto libre (con dificultad) se implementa en pasos posteriores */
+        printf("[Box %d] (pendiente) texto: %s\n", getpid(), payload);
         *meeseeks_created = 0;
         return 1;
     }
@@ -200,7 +330,10 @@ static int handle_request(req_type_t type, const char *payload, int *meeseeks_cr
         return 0;
     }
     if (pid == 0) {
-        meeseeks_run_program(payload);   /* no regresa */
+        if (type == REQ_CALC)
+            meeseeks_calc(payload);      /* no regresa */
+        else
+            meeseeks_run_program(payload);   /* no regresa */
         _exit(1);
     }
  
